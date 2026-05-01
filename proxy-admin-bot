@@ -1,8 +1,9 @@
 import json
 import os
+import subprocess
 import time
-from pathlib import Path
 from ipaddress import ip_address
+from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
@@ -21,15 +22,22 @@ from telegram.ext import (
 TOKEN = os.getenv("8239511808:AAFkKOVC4r9w9VxfHBolFj_ENe32rdEARfc")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "7210704553"))
 
-DATA_DIR = Path("/root")
+DATA_DIR = Path(os.getenv("BOT_DATA_DIR", "/root"))
 ALLOWED_IPS_FILE = DATA_DIR / "allowed_ips.json"
-FREE_MODE_FILE = DATA_DIR / "free_mode.txt"
 FREE_PROXY_FILE = DATA_DIR / "free_proxy.json"
+FREE_MODE_FILE = DATA_DIR / "free_mode.txt"
+PROXY_PID_FILE = DATA_DIR / "proxy.pid"
 
 PROXY_IP = "185.237.15.10"
 PROXY_PORT = "5555"
 BOT_USERNAME = "@Fakeryyi_bot"
 CHANNEL_LINK = "https://t.me/+gWDlKiD7hWRlODNk"
+
+DEFAULT_PROXY_COMMAND = (
+    'mitmdump -s /root/drageclint.py -p 5555 '
+    '--set block_global=false '
+    '--ignore-hosts ".*(instagram|facebook|fbcdn|icloud|apple)\\.com"'
+)
 
 DEFAULT_MINUTES = 60
 
@@ -41,9 +49,14 @@ STATE_FREE_CUSTOM = "free_custom"
 
 
 # =============================
-# JSON HELPERS
+# FILE HELPERS
 # =============================
+def ensure_data_dir() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
 def read_json(path: Path, default):
+    ensure_data_dir()
     try:
         if not path.exists():
             return default
@@ -53,13 +66,14 @@ def read_json(path: Path, default):
         return default
 
 
-def write_json(path: Path, data):
+def write_json(path: Path, data) -> None:
+    ensure_data_dir()
     with path.open("w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, sort_keys=True)
 
 
 # =============================
-# ACCESS / IP HELPERS
+# BASIC HELPERS
 # =============================
 def is_admin(update: Update) -> bool:
     user = update.effective_user
@@ -88,12 +102,27 @@ def parse_ip_line(line: str):
     return validate_ip(raw_ip), minutes
 
 
+def human_time_left(expires_at: float) -> str:
+    seconds = max(0, int(expires_at - time.time()))
+    minutes, sec = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {sec}s"
+    return f"{sec}s"
+
+
+# =============================
+# IP MANAGEMENT
+# =============================
 def load_allowed_ips():
     data = read_json(ALLOWED_IPS_FILE, {})
     return data if isinstance(data, dict) else {}
 
 
-def save_allowed_ips(data):
+def save_allowed_ips(data) -> None:
     write_json(ALLOWED_IPS_FILE, data)
 
 
@@ -113,7 +142,7 @@ def cleanup_expired_ips():
     return active
 
 
-def add_ip(ip: str, minutes: int):
+def add_ip(ip: str, minutes: int) -> None:
     ips = load_allowed_ips()
     now = time.time()
 
@@ -128,24 +157,13 @@ def add_ip(ip: str, minutes: int):
 
 def remove_ip(ip: str) -> bool:
     ips = load_allowed_ips()
+
     if ip not in ips:
         return False
 
     del ips[ip]
     save_allowed_ips(ips)
     return True
-
-
-def human_time_left(expires_at: float) -> str:
-    seconds = max(0, int(expires_at - time.time()))
-    minutes, sec = divmod(seconds, 60)
-    hours, minutes = divmod(minutes, 60)
-
-    if hours:
-        return f"{hours}h {minutes}m"
-    if minutes:
-        return f"{minutes}m {sec}s"
-    return f"{sec}s"
 
 
 # =============================
@@ -163,7 +181,7 @@ def free_mode_active() -> bool:
     return False
 
 
-def enable_free_mode(minutes: int | None = None):
+def enable_free_mode(minutes: int | None = None) -> None:
     now = time.time()
 
     if minutes is None:
@@ -186,9 +204,12 @@ def enable_free_mode(minutes: int | None = None):
     )
 
 
-def disable_free_mode():
-    if FREE_MODE_FILE.exists():
-        FREE_MODE_FILE.unlink()
+def disable_free_mode() -> None:
+    try:
+        if FREE_MODE_FILE.exists():
+            FREE_MODE_FILE.unlink()
+    except Exception:
+        pass
 
     write_json(
         FREE_PROXY_FILE,
@@ -214,11 +235,83 @@ def free_mode_status_text() -> str:
 
 
 # =============================
+# PROXY PROCESS
+# =============================
+def proxy_running() -> bool:
+    try:
+        result = subprocess.run(
+            "pgrep -f mitmdump",
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        return bool(result.stdout.strip())
+    except Exception:
+        return False
+
+
+def start_proxy_process() -> str:
+    if proxy_running():
+        return "▶️ Proxy already running."
+
+    command = os.getenv("PROXY_COMMAND", DEFAULT_PROXY_COMMAND)
+
+    try:
+        log_file = open("/root/nohup_proxy.out", "a", encoding="utf-8")
+
+        process = subprocess.Popen(
+            command,
+            shell=True,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+
+        PROXY_PID_FILE.write_text(str(process.pid), encoding="utf-8")
+
+        return f"✅ Proxy started.\nPID: <code>{process.pid}</code>"
+
+    except Exception as e:
+        return f"❌ Failed to start proxy:\n<code>{e}</code>"
+
+
+def stop_proxy_process() -> str:
+    try:
+        subprocess.run("pkill -f mitmdump", shell=True)
+    except Exception:
+        pass
+
+    try:
+        if PROXY_PID_FILE.exists():
+            PROXY_PID_FILE.unlink()
+    except Exception:
+        pass
+
+    time.sleep(1)
+
+    if proxy_running():
+        try:
+            subprocess.run("pkill -9 -f mitmdump", shell=True)
+        except Exception:
+            pass
+
+    if proxy_running():
+        return "⚠️ Tried to stop proxy, but it still looks running."
+
+    return "✅ Proxy stopped."
+
+
+# =============================
 # MENUS
 # =============================
 def main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
+            [
+                InlineKeyboardButton("▶️ Start Proxy", callback_data="start_proxy"),
+                InlineKeyboardButton("⏹ Stop Proxy", callback_data="stop_proxy"),
+            ],
             [
                 InlineKeyboardButton("➕ Add IP", callback_data="add_ip"),
                 InlineKeyboardButton("📥 Bulk Import", callback_data="bulk_import"),
@@ -276,9 +369,11 @@ def user_menu() -> InlineKeyboardMarkup:
 # =============================
 def admin_dashboard() -> str:
     ips = cleanup_expired_ips()
+    proxy_status = "🟢 Running" if proxy_running() else "🔴 Stopped"
 
     return (
         "🔐 <b>Proxy Admin Panel</b>\n\n"
+        f"<b>Proxy:</b> {proxy_status}\n"
         f"<b>Whitelisted IPs:</b> <code>{len(ips)}</code>\n"
         f"<b>Free Mode:</b> {free_mode_status_text()}\n\n"
         "Choose option below:"
@@ -316,9 +411,9 @@ def proxy_steps() -> str:
 
 
 # =============================
-# HANDLERS
+# TELEGRAM HANDLERS
 # =============================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data["state"] = STATE_NONE
 
     if is_admin(update):
@@ -334,7 +429,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
 
     try:
@@ -365,6 +460,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             admin_dashboard(),
             reply_markup=main_menu(),
+            parse_mode=ParseMode.HTML,
+        )
+
+    elif action == "start_proxy":
+        await query.edit_message_text(
+            start_proxy_process(),
+            reply_markup=back_menu(),
+            parse_mode=ParseMode.HTML,
+        )
+
+    elif action == "stop_proxy":
+        await query.edit_message_text(
+            stop_proxy_process(),
+            reply_markup=back_menu(),
             parse_mode=ParseMode.HTML,
         )
 
@@ -469,7 +578,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin(update):
         return
 
@@ -558,14 +667,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =============================
 # MAIN
 # =============================
-def validate_config():
+def validate_config() -> None:
     if not TOKEN:
         raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
     if not ADMIN_ID:
         raise RuntimeError("Missing ADMIN_ID")
 
 
-def main():
+def main() -> None:
     validate_config()
 
     app = ApplicationBuilder().token(TOKEN).build()
