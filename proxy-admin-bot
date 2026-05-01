@@ -3,10 +3,10 @@ import os
 import signal
 import subprocess
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from ipaddress import ip_address
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
@@ -22,24 +22,29 @@ from telegram.ext import (
 # -----------------------------
 # Configuration
 # -----------------------------
-# Never hardcode your bot token in the source code.
-# Linux/macOS:
-#   export TELEGRAM_BOT_TOKEN="123:abc"
+# Run with:
+#   export TELEGRAM_BOT_TOKEN="YOUR_NEW_BOT_TOKEN"
 #   export ADMIN_ID="7210704553"
-# Optional proxy command:
-#   export PROXY_COMMAND="python3 proxy_server.py"
-TOKEN = os.getenv("8239511808:AAFkKOVC4r9w9VxfHBolFj_ENe32rdEARfc")
-ADMIN_ID = int(os.getenv("7210704553", "0"))
+#   export PROXY_COMMAND="mitmdump -s /root/drageclint.py -p 5555 --set block_global=false"
+#   python3 /root/bot_admin.py
+
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 PROXY_COMMAND = os.getenv("PROXY_COMMAND", "").strip()
 
-DATA_DIR = Path(os.getenv("BOT_DATA_DIR", "."))
+BOT_USERNAME = os.getenv("BOT_USERNAME", "@Fakeryyi_bot")
+CHANNEL_LINK = os.getenv("CHANNEL_LINK", "https://t.me/+gWDlKiD7hWRlODNk")
+PROXY_IP = os.getenv("PROXY_IP", "185.237.15.10")
+PROXY_PORT = os.getenv("PROXY_PORT", "5555")
+
+DATA_DIR = Path(os.getenv("BOT_DATA_DIR", "/root"))
 ALLOWED_IPS_FILE = DATA_DIR / "allowed_ips.json"
 STATS_FILE = DATA_DIR / "stats.json"
 PROXY_PID_FILE = DATA_DIR / "proxy.pid"
+USERS_DB_FILE = DATA_DIR / "users_db.json"
 
 DEFAULT_MINUTES = 60
 
-# Conversation states stored per admin user
 STATE_NONE = "none"
 STATE_ADD_IP = "add_ip"
 STATE_BULK_IMPORT = "bulk_import"
@@ -67,11 +72,10 @@ def read_json(path: Path, default: Any) -> Any:
 def write_json(path: Path, data: Any) -> None:
     ensure_data_dir()
     with path.open("w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, sort_keys=True)
+        json.dump(data, f, indent=2, sort_keys=True, ensure_ascii=False)
 
 
 def load_allowed_ips() -> Dict[str, Dict[str, Any]]:
-    """Returns {ip: {expires_at: unix_ts, minutes: int, created_at: unix_ts}}."""
     data = read_json(ALLOWED_IPS_FILE, {})
     return data if isinstance(data, dict) else {}
 
@@ -96,6 +100,40 @@ def save_stats(stats: Dict[str, Any]) -> None:
     write_json(STATS_FILE, stats)
 
 
+def load_users_db() -> Dict[str, Dict[str, Any]]:
+    data = read_json(USERS_DB_FILE, {})
+    return data if isinstance(data, dict) else {}
+
+
+def save_users_db(data: Dict[str, Dict[str, Any]]) -> None:
+    write_json(USERS_DB_FILE, data)
+
+
+def save_user(update: Update) -> None:
+    user = update.effective_user
+    if not user:
+        return
+
+    users = load_users_db()
+    user_id = str(user.id)
+    now = int(time.time())
+
+    old = users.get(user_id, {})
+    users[user_id] = {
+        "id": user.id,
+        "is_bot": user.is_bot,
+        "first_name": user.first_name or "",
+        "last_name": user.last_name or "",
+        "username": user.username or "",
+        "language_code": user.language_code or "",
+        "is_admin": user.id == ADMIN_ID,
+        "first_seen": old.get("first_seen", now),
+        "last_seen": now,
+        "start_count": int(old.get("start_count", 0)) + 1,
+    }
+    save_users_db(users)
+
+
 # -----------------------------
 # Validation and formatting
 # -----------------------------
@@ -106,17 +144,16 @@ def is_admin(update: Update) -> bool:
 
 def validate_ip(value: str) -> str:
     value = value.strip()
-    # Allows IPv4 and IPv6. Raises ValueError if invalid.
     return str(ip_address(value))
 
 
 def parse_ip_line(line: str) -> tuple[str, int]:
-    """Accepts either 'IP' or 'IP:minutes'."""
     line = line.strip()
     if not line:
         raise ValueError("empty line")
 
-    if ":" in line and line.count(":") == 1:
+    # Only IP:minutes for IPv4. IPv6 must be sent without minutes.
+    if line.count(":") == 1:
         raw_ip, raw_minutes = line.split(":", 1)
         minutes = int(raw_minutes.strip() or DEFAULT_MINUTES)
     else:
@@ -129,10 +166,19 @@ def parse_ip_line(line: str) -> tuple[str, int]:
     return validate_ip(raw_ip), minutes
 
 
+def fmt_time(ts: Optional[float]) -> str:
+    if not ts:
+        return "-"
+    return datetime.fromtimestamp(float(ts)).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def human_time_left(expires_at: float) -> str:
     seconds = max(0, int(expires_at - time.time()))
     minutes, sec = divmod(seconds, 60)
     hours, minutes = divmod(minutes, 60)
+    days, hours = divmod(hours, 24)
+    if days:
+        return f"{days}d {hours}h"
     if hours:
         return f"{hours}h {minutes}m"
     if minutes:
@@ -140,19 +186,57 @@ def human_time_left(expires_at: float) -> str:
     return f"{sec}s"
 
 
+def proxy_user_count_from_stats() -> int:
+    stats = load_stats()
+    top_ips = stats.get("top_ips", {}) or {}
+    return len(top_ips) if isinstance(top_ips, dict) else 0
+
+
 def format_dashboard() -> str:
     stats = load_stats()
     ips = cleanup_expired_ips()
+    users = load_users_db()
     proxy_status = "🟢 Running" if proxy_running() else "🔴 Stopped"
 
     return (
         "🔐 <b>Proxy Admin Panel</b>\n\n"
         f"<b>Status:</b> {proxy_status}\n"
-        f"<b>Whitelisted IPs:</b> {len(ips)}\n\n"
+        f"<b>Whitelisted IPs:</b> {len(ips)}\n"
+        f"<b>Bot Users:</b> {len(users)}\n"
+        f"<b>Proxy IP Users:</b> {proxy_user_count_from_stats()}\n\n"
         "📊 <b>Traffic</b>\n"
         f"• Total requests: <code>{stats.get('requests', 0)}</code>\n"
         f"• Allowed: <code>{stats.get('allowed', 0)}</code>\n"
         f"• Blocked: <code>{stats.get('blocked', 0)}</code>"
+    )
+
+
+def user_welcome_text() -> str:
+    return (
+        "👋 <b>Welcome to Proxy Bot</b>\n\n"
+        "📢 First, join our channel.\n"
+        "After that click <b>Start</b> to see the proxy steps.\n\n"
+        f"BOT: <b>{BOT_USERNAME}</b>\n"
+        f"IP: <code>{PROXY_IP}</code>\n"
+        f"Port: <code>{PROXY_PORT}</code>"
+    )
+
+
+def proxy_steps_text() -> str:
+    return (
+        "✅ <b>Proxy Details</b>\n\n"
+        f"BOT: <b>{BOT_USERNAME}</b>\n\n"
+        f"IP: <code>{PROXY_IP}</code>\n"
+        f"Port: <code>{PROXY_PORT}</code>\n\n"
+        "<b>Steps:</b>\n"
+        "1. Open your browser.\n"
+        "2. Go to: http://mitm.it\n"
+        "3. Download the certificate.\n"
+        "4. Install the certificate.\n"
+        "5. Trust the certificate.\n"
+        "6. Open the game.\n"
+        "7. Enjoy!\n\n"
+        f"📢 Channel:\n{CHANNEL_LINK}"
     )
 
 
@@ -168,6 +252,10 @@ def main_menu() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("➖ Remove IP", callback_data="remove_ip"),
             ],
             [
+                InlineKeyboardButton("👥 Bot Users", callback_data="bot_users"),
+                InlineKeyboardButton("🌐 Proxy Users", callback_data="proxy_users"),
+            ],
+            [
                 InlineKeyboardButton("📊 Stats", callback_data="stats"),
                 InlineKeyboardButton("🧹 Clear Expired", callback_data="clear_expired"),
             ],
@@ -179,6 +267,24 @@ def main_menu() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("🗑 Clear All IPs", callback_data="clear_all_confirm"),
                 InlineKeyboardButton("🔄 Refresh", callback_data="refresh"),
             ],
+        ]
+    )
+
+
+def user_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📢 Join Channel", url=CHANNEL_LINK)],
+            [InlineKeyboardButton("▶️ Start", callback_data="user_start_proxy_steps")],
+        ]
+    )
+
+
+def user_steps_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📢 Join Channel", url=CHANNEL_LINK)],
+            [InlineKeyboardButton("🔄 Back", callback_data="user_back")],
         ]
     )
 
@@ -213,11 +319,7 @@ def remove_ip(ip: str) -> bool:
 def cleanup_expired_ips() -> Dict[str, Dict[str, Any]]:
     ips = load_allowed_ips()
     now = time.time()
-    active = {
-        ip: meta
-        for ip, meta in ips.items()
-        if float(meta.get("expires_at", 0)) > now
-    }
+    active = {ip: meta for ip, meta in ips.items() if float(meta.get("expires_at", 0)) > now}
     if len(active) != len(ips):
         save_allowed_ips(active)
     return active
@@ -226,7 +328,7 @@ def cleanup_expired_ips() -> Dict[str, Dict[str, Any]]:
 # -----------------------------
 # Proxy process management
 # -----------------------------
-def read_proxy_pid() -> int | None:
+def read_proxy_pid() -> Optional[int]:
     if not PROXY_PID_FILE.exists():
         return None
     try:
@@ -251,10 +353,7 @@ def start_proxy_process() -> str:
         return "▶️ Proxy is already running."
 
     if not PROXY_COMMAND:
-        return (
-            "⚠️ Proxy command is not configured.\n"
-            "Set <code>PROXY_COMMAND</code> before using this button."
-        )
+        return "⚠️ Proxy command is not configured. Set <code>PROXY_COMMAND</code> first."
 
     process = subprocess.Popen(
         PROXY_COMMAND,
@@ -288,34 +387,108 @@ def stop_proxy_process() -> str:
 
 
 # -----------------------------
+# Admin reports
+# -----------------------------
+def format_bot_users_report() -> str:
+    users = load_users_db()
+    if not users:
+        return "👥 <b>Bot Users</b>\n\nNo users yet."
+
+    rows = []
+    for user_id, info in sorted(users.items(), key=lambda item: item[1].get("last_seen", 0), reverse=True)[:30]:
+        username = info.get("username") or "-"
+        first_name = info.get("first_name") or "-"
+        last_name = info.get("last_name") or ""
+        language = info.get("language_code") or "-"
+        starts = info.get("start_count", 0)
+        last_seen = fmt_time(info.get("last_seen"))
+        admin_mark = " 🛡" if info.get("is_admin") else ""
+        rows.append(
+            f"• <code>{user_id}</code>{admin_mark}\n"
+            f"  Name: <b>{first_name} {last_name}</b>\n"
+            f"  Username: @{username}\n"
+            f"  Lang: <code>{language}</code> | Starts: <code>{starts}</code>\n"
+            f"  Last seen: <code>{last_seen}</code>"
+        )
+
+    return f"👥 <b>Bot Users</b> — <code>{len(users)}</code> total\n\n" + "\n\n".join(rows)
+
+
+def format_proxy_users_report() -> str:
+    stats = load_stats()
+    top_ips = stats.get("top_ips", {}) or {}
+    if not isinstance(top_ips, dict) or not top_ips:
+        return (
+            "🌐 <b>Proxy Users</b>\n\n"
+            "No proxy IP traffic saved yet.\n\n"
+            "Note: this page reads <code>stats.json</code>. "
+            "Your <code>drageclint.py</code> script must update requests, allowed, blocked and top_ips."
+        )
+
+    lines = []
+    for ip, count in sorted(top_ips.items(), key=lambda x: x[1], reverse=True)[:50]:
+        whitelisted = "✅ whitelisted" if ip in cleanup_expired_ips() else "❌ not active"
+        lines.append(f"• <code>{ip}</code> — <b>{count}</b> requests — {whitelisted}")
+
+    return (
+        "🌐 <b>Proxy Users by IP</b>\n\n"
+        f"Unique IPs: <code>{len(top_ips)}</code>\n"
+        f"Total requests: <code>{stats.get('requests', 0)}</code>\n"
+        f"Allowed: <code>{stats.get('allowed', 0)}</code>\n"
+        f"Blocked: <code>{stats.get('blocked', 0)}</code>\n\n"
+        + "\n".join(lines)
+    )
+
+
+# -----------------------------
 # Telegram handlers
 # -----------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update):
-        await update.message.reply_text("❌ Unauthorized")
+    save_user(update)
+    context.user_data["state"] = STATE_NONE
+
+    if is_admin(update):
+        await update.message.reply_html(format_dashboard(), reply_markup=main_menu())
         return
 
-    context.user_data["state"] = STATE_NONE
-    await update.message.reply_html(format_dashboard(), reply_markup=main_menu())
+    await update.message.reply_html(user_welcome_text(), reply_markup=user_menu())
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-
-    if not is_admin(update):
-        await query.edit_message_text("❌ Unauthorized")
-        return
+    save_user(update)
 
     action = query.data
+
+    # Normal user buttons
+    if not is_admin(update):
+        if action == "user_start_proxy_steps":
+            await query.edit_message_text(
+                proxy_steps_text(),
+                reply_markup=user_steps_menu(),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            return
+
+        if action == "user_back":
+            await query.edit_message_text(
+                user_welcome_text(),
+                reply_markup=user_menu(),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            return
+
+        await query.edit_message_text("❌ This option is only for admin.")
+        return
+
+    # Admin buttons
     context.user_data["state"] = STATE_NONE
 
     if action == "refresh":
-        await query.edit_message_text(
-            format_dashboard(),
-            reply_markup=main_menu(),
-            parse_mode=ParseMode.HTML,
-        )
+        await query.edit_message_text(format_dashboard(), reply_markup=main_menu(), parse_mode=ParseMode.HTML)
 
     elif action == "add_ip":
         context.user_data["state"] = STATE_ADD_IP
@@ -356,10 +529,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             message = "📋 <b>Active IPs</b>\n\n" + "\n".join(rows[:50])
         await query.edit_message_text(message, reply_markup=back_menu(), parse_mode=ParseMode.HTML)
 
+    elif action == "bot_users":
+        await query.edit_message_text(format_bot_users_report(), reply_markup=back_menu(), parse_mode=ParseMode.HTML)
+
+    elif action == "proxy_users":
+        await query.edit_message_text(format_proxy_users_report(), reply_markup=back_menu(), parse_mode=ParseMode.HTML)
+
     elif action == "stats":
         stats = load_stats()
         top_ips = stats.get("top_ips", {}) or {}
-        top_lines = [f"• <code>{ip}</code>: {count}" for ip, count in sorted(top_ips.items(), key=lambda x: x[1], reverse=True)[:5]]
+        top_lines = [
+            f"• <code>{ip}</code>: {count}"
+            for ip, count in sorted(top_ips.items(), key=lambda x: x[1], reverse=True)[:5]
+        ]
         message = (
             "📊 <b>Stats</b>\n\n"
             f"Total requests: <code>{stats.get('requests', 0)}</code>\n"
@@ -402,7 +584,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    save_user(update)
+
     if not is_admin(update):
+        await update.message.reply_html(user_welcome_text(), reply_markup=user_menu())
         return
 
     text = (update.message.text or "").strip()
