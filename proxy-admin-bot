@@ -19,7 +19,7 @@ from telegram.ext import (
 # =============================
 # CONFIG
 # =============================
-TOKEN = os.getenv("8239511808:AAFkKOVC4r9w9VxfHBolFj_ENe32rdEARfc")
+TOKEN = os.getenv("TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "7210704553"))
 
 DATA_DIR = Path(os.getenv("BOT_DATA_DIR", "/root"))
