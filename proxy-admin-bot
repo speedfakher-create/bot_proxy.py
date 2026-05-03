@@ -45,6 +45,9 @@ DEFAULT_PROXY_COMMAND = (
 DEFAULT_MINUTES = 60
 USER_FREE_MINUTES = 24 * 60
 
+PLAN_VIP = "vip"
+PLAN_FREE_USER = "free_user"
+
 STATE_NONE = "none"
 STATE_ADD_IP = "add_ip"
 STATE_REMOVE_IP = "remove_ip"
@@ -249,7 +252,16 @@ def cleanup_expired_ips():
     return active
 
 
-def add_ip(ip: str, minutes: int, telegram_id: int | None = None) -> None:
+def add_ip(
+    ip: str,
+    minutes: int,
+    telegram_id: int | None = None,
+    plan: str = PLAN_VIP,
+) -> None:
+    """
+    plan='vip'       => admin-added IP. Stays allowed when Free Mode is OFF.
+    plan='free_user' => free/user IP. Works only while Free Mode is ON if drageclint.py checks plan.
+    """
     ips = load_allowed_ips()
     now = time.time()
 
@@ -257,6 +269,7 @@ def add_ip(ip: str, minutes: int, telegram_id: int | None = None) -> None:
         "created_at": now,
         "expires_at": now + minutes * 60,
         "minutes": minutes,
+        "plan": plan,
     }
 
     if telegram_id:
@@ -275,6 +288,24 @@ def remove_ip(ip: str) -> bool:
     del ips[ip]
     save_allowed_ips(ips)
     return True
+
+
+def count_ips_by_plan():
+    ips = cleanup_expired_ips()
+    vip = 0
+    free_user = 0
+    unknown = 0
+
+    for meta in ips.values():
+        plan = meta.get("plan", PLAN_VIP)
+        if plan == PLAN_VIP:
+            vip += 1
+        elif plan == PLAN_FREE_USER:
+            free_user += 1
+        else:
+            unknown += 1
+
+    return vip, free_user, unknown
 
 
 # =============================
@@ -424,8 +455,8 @@ def main_menu() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("⏹ Stop Proxy", callback_data="stop_proxy"),
             ],
             [
-                InlineKeyboardButton("➕ Add IP", callback_data="add_ip"),
-                InlineKeyboardButton("📥 Bulk Import", callback_data="bulk_import"),
+                InlineKeyboardButton("➕ Add VIP IP", callback_data="add_ip"),
+                InlineKeyboardButton("📥 Bulk VIP Import", callback_data="bulk_import"),
             ],
             [
                 InlineKeyboardButton("📋 Active IPs", callback_data="list_ips"),
@@ -512,6 +543,7 @@ def back_menu() -> InlineKeyboardMarkup:
 # =============================
 def admin_dashboard() -> str:
     ips = cleanup_expired_ips()
+    vip_count, free_user_count, unknown_count = count_ips_by_plan()
     proxy_status = "🟢 Running" if proxy_running() else "🔴 Stopped"
     stats = load_stats()
     proxy_users_count = len(stats.get("top_ips", {}))
@@ -522,6 +554,9 @@ def admin_dashboard() -> str:
         "🔐 <b>Proxy Admin Panel</b>\n\n"
         f"<b>Proxy:</b> {proxy_status}\n"
         f"<b>Whitelisted IPs:</b> <code>{len(ips)}</code>\n"
+        f"• VIP: <code>{vip_count}</code>\n"
+        f"• Free users: <code>{free_user_count}</code>\n"
+        f"• Unknown/old: <code>{unknown_count}</code>\n"
         f"<b>Proxy Users:</b> <code>{proxy_users_count}</code>\n"
         f"<b>Admins:</b> <code>{admin_count}</code>\n"
         f"<b>Banned IDs:</b> <code>{banned_count}</code>\n"
@@ -548,9 +583,12 @@ def user_start_text(user_id: int) -> str:
 
 def proxy_steps(ip: str) -> str:
     return (
-        "✅ <b>Access Granted</b>\n\n"
+        "✅ <b>Free Access Granted</b>\n\n"
         f"Your IP: <code>{ip}</code>\n"
-        f"Time: <b>{USER_FREE_MINUTES // 60} hours</b>\n\n"
+        f"Time: <b>{USER_FREE_MINUTES // 60} hours</b>\n"
+        "Type: <b>Free User</b>\n\n"
+        "⚠️ This access works only while Free Mode is ON.\n"
+        "If Free Mode is OFF, only VIP IPs added by admin can connect.\n\n"
         f"BOT: {BOT_USERNAME}\n"
         f"IP: <code>{PROXY_IP}</code>\n"
         f"Port: <code>{PROXY_PORT}</code>\n\n"
@@ -736,7 +774,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif action == "free_on":
         enable_free_mode(None)
         await query.edit_message_text(
-            "✅ <b>Free Mode is now ON.</b>\n\nEveryone can connect.",
+            "✅ <b>Free Mode is now ON.</b>\n\n"
+            "Everyone can connect.\n\n"
+            "VIP IPs still stay VIP. Free users stop working when Free Mode is OFF.",
             reply_markup=free_menu(),
             parse_mode=ParseMode.HTML,
         )
@@ -744,7 +784,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif action == "free_off":
         disable_free_mode()
         await query.edit_message_text(
-            "❌ <b>Free Mode is now OFF.</b>\n\nOnly allowed IPs can connect.",
+            "❌ <b>Free Mode is now OFF.</b>\n\n"
+            "Only VIP IPs added by admin can connect.\n"
+            "Free users will now get 403.",
             reply_markup=free_menu(),
             parse_mode=ParseMode.HTML,
         )
@@ -776,7 +818,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif action == "add_ip":
         context.user_data["state"] = STATE_ADD_IP
         await query.edit_message_text(
-            "➕ <b>Add IP</b>\n\nSend IP like:\n<code>1.2.3.4</code>\n\nOr:\n<code>1.2.3.4:120</code>",
+            "➕ <b>Add VIP IP</b>\n\n"
+            "Send IP like:\n<code>1.2.3.4</code>\n\n"
+            "Or:\n<code>1.2.3.4:120</code>\n\n"
+            "This IP will stay allowed even when Free Mode is OFF.",
             reply_markup=back_menu(),
             parse_mode=ParseMode.HTML,
         )
@@ -784,7 +829,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif action == "bulk_import":
         context.user_data["state"] = STATE_BULK_IMPORT
         await query.edit_message_text(
-            "📥 <b>Bulk Import</b>\n\nSend IPs, one per line:\n<code>1.2.3.4:60\n8.8.8.8:120</code>",
+            "📥 <b>Bulk VIP Import</b>\n\n"
+            "Send IPs, one per line:\n<code>1.2.3.4:60\n8.8.8.8:120</code>\n\n"
+            "These IPs will stay allowed even when Free Mode is OFF.",
             reply_markup=back_menu(),
             parse_mode=ParseMode.HTML,
         )
@@ -806,8 +853,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             rows = []
             for ip, meta in sorted(ips.items())[:50]:
                 telegram_id = meta.get("telegram_id", "-")
+                plan = meta.get("plan", PLAN_VIP)
+                label = "VIP" if plan == PLAN_VIP else "FREE" if plan == PLAN_FREE_USER else plan
                 rows.append(
-                    f"• <code>{ip}</code> — {human_time_left(float(meta['expires_at']))} — TG: <code>{telegram_id}</code>"
+                    f"• <code>{ip}</code> — <b>{label}</b> — "
+                    f"{human_time_left(float(meta['expires_at']))} — TG: <code>{telegram_id}</code>"
                 )
             msg = "📋 <b>Active IPs</b>\n\n" + "\n".join(rows)
 
@@ -829,7 +879,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if state == STATE_USER_SEND_IP:
             try:
                 ip = validate_ip(text)
-                add_ip(ip, USER_FREE_MINUTES, telegram_id=update.effective_user.id)
+                add_ip(
+                    ip,
+                    USER_FREE_MINUTES,
+                    telegram_id=update.effective_user.id,
+                    plan=PLAN_FREE_USER,
+                )
                 context.user_data["state"] = STATE_NONE
 
                 await update.message.reply_html(
@@ -930,11 +985,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if state == STATE_ADD_IP:
         try:
             ip, minutes = parse_ip_line(text)
-            add_ip(ip, minutes)
+            add_ip(ip, minutes, plan=PLAN_VIP)
             context.user_data["state"] = STATE_NONE
 
             await update.message.reply_html(
-                f"✅ Added <code>{ip}</code> for <b>{minutes}</b> minutes.",
+                f"✅ Added VIP <code>{ip}</code> for <b>{minutes}</b> minutes.",
                 reply_markup=main_menu(),
             )
         except Exception as e:
@@ -951,7 +1006,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
             try:
                 ip, minutes = parse_ip_line(line)
-                add_ip(ip, minutes)
+                add_ip(ip, minutes, plan=PLAN_VIP)
                 added += 1
             except Exception:
                 errors += 1
@@ -959,7 +1014,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         context.user_data["state"] = STATE_NONE
 
         await update.message.reply_html(
-            f"✅ Added <b>{added}</b> IPs.\n⚠️ Skipped <b>{errors}</b> lines.",
+            f"✅ Added <b>{added}</b> VIP IPs.\n⚠️ Skipped <b>{errors}</b> lines.",
             reply_markup=main_menu(),
         )
         return
